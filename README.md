@@ -19,6 +19,6 @@ Unlike traditional methods that focus on cell embeddings, MOSAIC explicitly mode
 
 ## Example tutorial
 
-- Please check the MOSAIC tutorial, available in both [Rmd]() and [HTML]().
+- Please check the MOSAIC tutorial, available in both [Rmd](https://github.com/KlugerLab/MOSAIC/blob/main/MOSAIC_demo.Rmd) and [HTML]().
 - The supporting functions used in the tutorial are available in [`.R`]().
 - Dataset used in the tutorial can be downloaded through this [link](https://atlas.fredhutch.org/data/nygc/multimodal/pbmc_multimodal.h5seurat).
