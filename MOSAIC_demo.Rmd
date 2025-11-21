@@ -155,7 +155,7 @@ print(head(DC_table))
 ## Visualization
 ### Pathway Enrichment of DC Features
 
-```{r fig.width=6, fig.height=12, dpi=300,fig.align='center',out.width = "50%"}
+```{r fig.width=6, fig.height=9, dpi=300,fig.align='center',out.width = "50%"}
 feature_list <- feature_names_filtered_no_prelix
 #background_genes <- feature_names_no_preflix
 
