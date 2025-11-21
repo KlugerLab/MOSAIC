@@ -13,7 +13,7 @@ Unlike traditional methods that focus on cell embeddings, MOSAIC explicitly mode
 - **Joint Feature $\times$ Sample Embedding:** Projects features and samples into a shared latent space.
 - **Differential Connectivity (DC) Analysis:** Identifies features (genes, proteins) that change their regulatory context between conditions, even without changes in abundance.
 - **Unsupervised Subgroup Detection:** Discovers patient subtypes driven by specific, coherent multi-modal feature modules.
-- **Scalable & Robust:** Linear complexity with respect to sample size ($O(S)$) and quadratic with respect to features ($O(F^2)$), utilizing truncated eigendecomposition. Robust to batch effects without explicit correction.
+- **Scalable & Robust:** Linear complexity with respect to sample size (O(S)) and quadratic with respect to features (O(F^2)), utilizing truncated eigendecomposition. Robust to batch effects without explicit correction.
 
 ***
 
