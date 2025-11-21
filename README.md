@@ -19,4 +19,5 @@ Unlike traditional methods that focus on cell embeddings, MOSAIC explicitly mode
 
 ## Example tutorial
 
-Please check the DiCoLo tutorial, available in both [Rmd]() and [HTML](). The supporting functions used in the tutorial are available in [`.R`]().
+Please check the MOSAIC tutorial, available in both [Rmd]() and [HTML](). The supporting functions used in the tutorial are available in [`.R`]().
+The dataset of the tutorial can be downloaded through this [link](https://atlas.fredhutch.org/data/nygc/multimodal/pbmc_multimodal.h5seurat).
