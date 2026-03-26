@@ -1,0 +1,257 @@
+---
+title: "Quick Start"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Quick Start}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = TRUE
+)
+```
+
+This vignette runs the MOSAIC pipeline on simulated data.
+
+We will:
+
+1. Generate synthetic multi-modal data with known differential connectivity (DC) signal
+2. Run the MOSAIC embedding
+3. Perform differential connectivity analysis
+4. Detect patient subgroups from feature modules
+
+## Step 1: Generate Simulated Data
+
+We simulate a two-modality dataset with 20 samples (10 per condition), where 20% of features undergo connectivity rewiring between conditions A and B.
+
+```{r simulate}
+library(MOSAIC)
+library(ggplot2)
+
+sim <- simulate_multimodal_data(
+  simulation_type = "DC",
+  n_features = c(500, 400),
+  signal_prop = 0.2,
+  seed = 42,
+  rescale = TRUE,
+  add_batch = FALSE,
+  nonlinear = FALSE,
+  sample_noise_level = 0.5,
+  feature_noise_level = 0.5,
+  cell_noise_level = 0.5
+)
+
+cat("Modalities:", length(sim$seurat_list), "\n")
+cat("Samples:", nrow(sim$sample_metadata), "\n")
+cat("Features per modality:", sapply(sim$seurat_list, nrow), "\n")
+```
+
+The returned Seurat objects include ground-truth labels: `feature_cluster` (which module a feature belongs to) and `is_de` (whether the feature was rewired).
+
+```{r ground-truth}
+# Ground truth for modality 1
+feat_meta <- sim$seurat_list[[1]][["originalexp"]][[]]
+cat("DC features in modality 1:", sum(feat_meta$is_de), "/", nrow(feat_meta), "\n")
+```
+
+## Step 2: Run MOSAIC Embedding
+
+```{r run-mosaic}
+result <- run_MOSAIC(
+  sim$seurat_list,
+  assays = c("originalexp", "originalexp"),
+  sample_meta = "sample_id",
+  condition_meta = "condition"
+)
+```
+
+### Visualize the Eigenvalue Spectrum
+
+Eigenvalues of the aggregated matrix; the red line marks the selected dimension.
+
+```{r eigenplot, fig.width = 5, fig.height = 3.5}
+elbow <- find_elbow_kneedle(result$eigenvalues)
+
+plot_eigen(result$eigenvalues) +
+  geom_vline(xintercept = elbow, color = "red", linetype = "dashed") +
+  ggtitle(paste0("Eigenvalue spectrum (elbow = ", elbow, ")"))
+```
+
+## Step 3: Differential Connectivity Analysis
+
+### 3a. Run the DC test
+
+`run_DC_test()` computes a PERMANOVA pseudo-F statistic for each feature and permutes the condition labels across samples. With 10 samples per condition, all 184,756 assignments are enumerated.
+
+```{r dc-test}
+dc <- run_DC_test(
+  result$mosaic_embed_list,
+  groups = result$annotation$Condition
+)
+
+c(exact = dc$exact, n_assignments = dc$n_perm)
+head(dc$results[order(dc$results$pvalue, -dc$results$F_stat), ])
+```
+
+### 3b. Compare with ground truth
+
+Rewired features (`is_de`) move to a different module in condition B, which also changes the coupling profiles of the features they are coupled to. We evaluate how well the pseudo-F statistic ranks the rewired features.
+
+```{r evaluate-dc}
+# Ground truth: combine is_de from both modalities
+ground_truth <- c(
+  sim$seurat_list[[1]][["originalexp"]][[]]$is_de,
+  sim$seurat_list[[2]][["originalexp"]][[]]$is_de
+)
+true_dc <- which(ground_truth)
+
+# Rank features by the observed pseudo-F statistic
+hits <- ground_truth[order(-dc$results$F_stat)]
+average_precision <- sum(cumsum(hits)[hits] / which(hits)) / sum(hits)
+top_k_precision <- mean(hits[seq_len(sum(hits))])
+
+cat(sprintf("Average precision: %.3f (random ranking: %.2f)\n",
+            average_precision, mean(ground_truth)))
+cat(sprintf("Precision among the top %d features: %.3f\n",
+            sum(hits), top_k_precision))
+
+# Features significant after Benjamini-Hochberg correction
+cat(sum(dc$results$padj < 0.05), "features with BH-adjusted P < 0.05, of which",
+    sum(dc$results$padj[true_dc] < 0.05), "of", length(true_dc), "rewired features\n")
+```
+
+### 3c. Visualize a DC feature
+
+Classical MDS of the Euclidean distances between the sample embeddings of one feature, the same distances used by the test.
+
+```{r mds-dc, fig.width = 5, fig.height = 4}
+# Pick a true DC feature
+chosen_idx <- true_dc[1]
+
+M_f <- t(sapply(result$mosaic_embed_list, function(e) e[chosen_idx, ]))
+
+plot_mds_cluster(
+  as.matrix(dist(M_f)), dis = TRUE,
+  title = paste("Feature", chosen_idx, "(true DC)"),
+  cluster = result$annotation$Condition,
+  custom_colors = c("A" = "#56B4E9", "B" = "#E69F00"),
+  size = 2,
+  ellipse_level = 0.68
+)
+```
+
+## Step 4: Unsupervised Subgroup Detection
+
+Condition labels are not used in this step.
+
+### 4a. Compute feature stratification profiles
+
+For each feature, the cosine similarity between its sample embeddings gives a sample-by-sample matrix; its upper triangle is the feature's stratification profile.
+
+```{r stratification}
+sim_list <- compute_feature_similarity(result$mosaic_embed_list)
+sim_vectors <- lapply(sim_list, function(mat) {
+  mat[upper.tri(mat, diag = FALSE)]
+})
+
+strat_matrix <- do.call(cbind, sim_vectors)
+feature_corr <- cor(strat_matrix, method = "spearman")
+```
+
+### 4b. Identify feature modules
+
+```{r modules}
+library(dynamicTreeCut)
+
+dist_feat <- as.dist(1 - feature_corr)
+hc_feat <- hclust(dist_feat, method = "ward.D2")
+
+feature_clusters <- cutreeDynamic(
+  dendro = hc_feat,
+  distM = as.matrix(dist_feat),
+  minClusterSize = 15,
+  method = "hybrid",
+  deepSplit = 2
+)
+names(feature_clusters) <- colnames(feature_corr)
+
+module_ids <- sort(unique(feature_clusters[feature_clusters > 0]))
+cat(length(module_ids), "modules identified\n")
+cat("Module sizes:", sapply(module_ids, function(m) sum(feature_clusters == m)), "\n")
+```
+
+### 4c. Screen modules for subgroups
+
+```{r screen-modules}
+total_features <- nrow(result$mosaic_embed_list[[1]])
+
+screen_results <- data.frame(
+  module = integer(), n_features = integer(),
+  silhouette = numeric(), balanced = logical(),
+  stringsAsFactors = FALSE
+)
+
+for (m in module_ids) {
+  idx <- which(feature_clusters == m)
+  sim_mat <- compute_module_similarity(result$mosaic_embed_list, idx)
+  partition <- find_partition_hclust(as.dist(1 - sim_mat))
+
+  screen_results <- rbind(screen_results, data.frame(
+    module = m,
+    n_features = length(idx),
+    silhouette = ifelse(partition$balanced, partition$silhouette, NA),
+    balanced = partition$balanced
+  ))
+}
+
+screen_results <- screen_results[order(-screen_results$silhouette), ]
+print(screen_results)
+```
+
+### 4d. Visualize the best module's heatmap
+
+```{r heatmap, fig.width = 5.5, fig.height = 5}
+library(pheatmap)
+
+best_module <- screen_results$module[which.max(screen_results$silhouette)]
+best_idx <- which(feature_clusters == best_module)
+
+sim_mat <- compute_module_similarity(result$mosaic_embed_list, best_idx)
+partition <- find_partition_hclust(as.dist(1 - sim_mat))
+
+annotation <- result$annotation
+annotation$Subgroup <- ifelse(partition$groups == 1, "Group1", "Group2")
+
+annotation_colors <- list(
+  Condition = c("A" = "#56B4E9", "B" = "#E69F00"),
+  Subgroup = c("Group1" = "#4DBBD5", "Group2" = "#E64B35")
+)
+
+pheatmap(
+  sim_mat,
+  annotation_row = annotation,
+  annotation_col = annotation,
+  annotation_colors = annotation_colors,
+  cluster_rows = partition$hclust,
+  cluster_cols = partition$hclust,
+  show_rownames = TRUE,
+  show_colnames = FALSE,
+  main = sprintf("Module %d | %d features | Silhouette = %.3f",
+                 best_module, length(best_idx), partition$silhouette)
+)
+
+cat("\nSubgroup x Condition:\n")
+print(table(annotation$Subgroup, annotation$Condition))
+```
+
+The subgroups of the top module are compared with the true conditions A and B.
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
