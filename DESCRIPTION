@@ -1,0 +1,43 @@
+Package: MOSAIC
+Title: Multi-Omic Sample-Wise Analysis of Inter-Feature Connectivity
+Version: 1.0.0
+Authors@R: c(
+    person("Chang", "Lu", email = "chang.lu@yale.edu", role = c("aut", "cre")),
+    person("Yuval", "Kluger", email = "yuval.kluger@yale.edu", role = "aut"),
+    person("Rong", "Ma", email = "rongma@hsph.harvard.edu", role = "aut")
+    )
+Description: MOSAIC (Multi-Omic Sample-wise Analysis of Inter-feature
+    Connectivity) is a spectral framework that learns a high-resolution
+    feature-by-sample joint embedding from population-scale single-cell
+    multi-omics data. For each individual, MOSAIC constructs a sample-specific
+    coupling matrix capturing complete intra- and cross-modality feature
+    interactions, then projects all samples into a shared latent space via
+    spectral integration. The resulting embedding represents each feature by its
+    connectivity profile relative to all other features, enabling direct
+    comparison of regulatory network topology across individuals. MOSAIC supports
+    differential connectivity analysis, unsupervised subgroup detection, and
+    clinical outcome prediction.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Imports:
+    Seurat (>= 5.0),
+    Matrix,
+    RSpectra,
+    ggplot2,
+    rlang,
+    methods,
+    parallel,
+    doParallel,
+    foreach,
+    vegan,
+    cluster,
+    RColorBrewer
+Suggests:
+    testthat (>= 3.0.0),
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr
+URL: https://github.com/KlugerLab/MOSAIC
+BugReports: https://github.com/KlugerLab/MOSAIC/issues

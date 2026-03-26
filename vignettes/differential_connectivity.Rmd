@@ -1,0 +1,255 @@
+---
+title: "Differential Connectivity Analysis"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Differential Connectivity Analysis}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE
+)
+```
+
+This vignette demonstrates MOSAIC's **Differential Connectivity (DC) analysis** pipeline. DC analysis identifies features whose regulatory network partners are rewired across conditions, even when their expression levels remain unchanged. We apply MOSAIC to a multi-omic CITE-seq dataset of human T cells profiled before and after vaccination.
+
+## Dataset
+
+We use a publicly available CITE-seq dataset ([Hao et al., 2021](https://doi.org/10.1016/j.cell.2021.04.048)) containing paired RNA and protein (ADT) measurements from human PBMCs across 8 donors, profiled at Day 0 (naive) and Day 7 (activated) post-vaccination. We focus on **CD4 Naive T cells** to isolate activation-specific signals.
+
+## Data Preprocessing
+
+```{r load-data}
+library(MOSAIC)
+library(Seurat)
+library(SeuratDisk)
+library(ggplot2)
+library(dplyr)
+
+# Load the CITE-seq data
+pbmc <- LoadH5Seurat("/banach2/chang/cleaned_rong_project/dataset/multi.h5seurat")
+
+# Subset to CD4 Naive T cells, Day 0 vs Day 7
+seurat_subset <- subset(pbmc, idents = "CD4 Naive")
+seurat_subset <- seurat_subset[, seurat_subset$time %in% c(0, 7)]
+```
+
+### Feature Selection
+
+We retain features expressed (total count > 3) in every sample, ensuring all features are measurable across the cohort.
+
+```{r feature-selection}
+# RNA features
+counts_rna <- GetAssayData(seurat_subset, assay = "SCT", slot = "counts")
+sample_ids <- unique(as.character(seurat_subset$orig.ident))
+
+genes_per_sample <- lapply(sample_ids, function(id) {
+  cells <- which(seurat_subset$orig.ident == id)
+  rownames(counts_rna)[rowSums(counts_rna[, cells, drop = FALSE]) > 3]
+})
+genes_to_keep <- Reduce(intersect, genes_per_sample)
+
+# ADT features
+counts_adt <- GetAssayData(seurat_subset, assay = "ADT", slot = "counts")
+proteins_per_sample <- lapply(sample_ids, function(id) {
+  cells <- which(seurat_subset$orig.ident == id)
+  rownames(counts_adt)[rowSums(counts_adt[, cells, drop = FALSE]) > 3]
+})
+proteins_to_keep <- Reduce(intersect, proteins_per_sample)
+
+# Subset features
+seurat_subset[["SCT"]] <- subset(seurat_subset[["SCT"]], features = genes_to_keep)
+seurat_subset[["ADT"]] <- subset(seurat_subset[["ADT"]], features = proteins_to_keep)
+```
+
+### Prepare Input for MOSAIC
+
+MOSAIC takes a list of normalized Seurat objects, one per modality. We split the combined object and normalize each modality separately.
+
+```{r prepare-input}
+# Add sample and condition metadata
+seurat_subset$sample_id <- seurat_subset$orig.ident
+seurat_subset$condition <- seurat_subset$time
+
+# Create feature name vector for later use
+feature_names <- c(
+  paste0("RNA_", rownames(seurat_subset[["SCT"]])),
+  paste0("ADT_", rownames(seurat_subset[["ADT"]]))
+)
+
+# Separate into per-modality Seurat objects
+seurat_rna <- seurat_subset
+seurat_rna[["ADT"]] <- NULL
+
+seurat_adt <- seurat_subset
+DefaultAssay(seurat_adt) <- "ADT"
+seurat_adt[["SCT"]] <- NULL
+
+# Normalize
+seurat_rna <- NormalizeData(seurat_rna)
+seurat_adt <- NormalizeData(seurat_adt, normalization.method = "CLR")
+```
+
+## Step 1: Run MOSAIC Embedding
+
+```{r run-mosaic}
+result <- run_MOSAIC(
+  seurat_list = list(RNA = seurat_rna, ADT = seurat_adt),
+  assays = c("SCT", "ADT"),
+  sample_meta = "sample_id",
+  condition_meta = "condition"
+)
+```
+
+### Visualize Eigenvalue Spectrum
+
+The eigenvalue spectrum from the aggregated spectral decomposition reveals the effective dimensionality of the shared latent space. The red dashed line marks the elbow point automatically selected by the Kneedle algorithm.
+
+```{r eigenplot, fig.width = 5, fig.height = 3.5}
+elbow <- find_elbow_kneedle(result$eigenvalues)
+
+plot_eigen(result$eigenvalues) +
+  geom_vline(xintercept = elbow, color = "red", linetype = "dashed") +
+  ggtitle(paste0("Global eigenvalues (elbow at ", elbow, ")"))
+```
+
+## Step 2: Run DC Test
+
+We run the per-feature PERMANOVA test on the real data to quantify how much each feature's embedding shifts between Day 0 and Day 7.
+
+```{r dc-test}
+n_sample <- length(result$mosaic_embed_list)
+
+dc_result <- run_DC_test(
+  result$mosaic_embed_list,
+  n_sample = n_sample,
+  groups = result$annotation$Condition,
+  dist_method = "euclidean"
+)
+```
+
+## Step 3: Construct Null Distribution
+
+To calibrate statistical significance, we shuffle the cell-to-sample labels to destroy condition-specific signals, re-run MOSAIC, and collect null F-statistics.
+
+```{r shuffle-null}
+# Shuffle sample labels
+set.seed(123)
+shuffled_indices <- sample(nrow(seurat_rna@meta.data))
+seurat_rna$shuffled_sample_id <- seurat_rna$sample_id[shuffled_indices]
+seurat_rna$shuffled_condition <- seurat_rna$condition[shuffled_indices]
+seurat_adt$shuffled_sample_id <- seurat_adt$sample_id[shuffled_indices]
+seurat_adt$shuffled_condition <- seurat_adt$condition[shuffled_indices]
+
+# Run MOSAIC on shuffled data
+shuffle_result <- run_MOSAIC(
+  seurat_list = list(RNA = seurat_rna, ADT = seurat_adt),
+  assays = c("SCT", "ADT"),
+  sample_meta = "shuffled_sample_id",
+  condition_meta = "shuffled_condition",
+  verbose = FALSE
+)
+
+# Run DC test on shuffled data
+shuffle_dc <- run_DC_test(
+  shuffle_result$mosaic_embed_list,
+  n_sample = n_sample,
+  groups = shuffle_result$annotation$Condition,
+  dist_method = "euclidean"
+)
+```
+
+## Step 4: Compute Empirical P-Values and Identify DC Features
+
+We compare each feature's observed F-statistic against the pooled null distribution of F-statistics from the shuffled run.
+
+```{r empirical-pvalues}
+F_obs <- unlist(dc_result$F_stats_list)
+F_null <- unlist(shuffle_dc$F_stats_list)
+
+pvalues <- sapply(F_obs, function(x) calculate_empirical_pvalue(x, F_null))
+
+# Identify significant DC features
+dc_idx <- which(pvalues < 0.05)
+cat(length(dc_idx), "DC features identified out of", length(pvalues), "total features\n")
+```
+
+### DC Feature Table
+
+```{r dc-table}
+dc_table <- data.frame(
+  Feature = feature_names[dc_idx],
+  F_statistic = F_obs[dc_idx],
+  R2 = dc_result$r2_list[dc_idx],
+  Empirical_pvalue = pvalues[dc_idx]
+)
+dc_table <- dc_table[order(dc_table$Empirical_pvalue, -dc_table$F_statistic), ]
+
+head(dc_table, 20)
+```
+
+## Step 5: Pathway Enrichment Analysis
+
+We perform Reactome pathway enrichment on the DC features to assess their biological coherence.
+
+```{r pathway-analysis}
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Hs.eg.db)
+
+# Extract gene symbols from DC features
+dc_feature_names <- feature_names[dc_idx]
+dc_gene_symbols <- sub("^(RNA_|ADT_)", "", dc_feature_names)
+
+# Convert to Entrez IDs
+entrez_ids <- bitr(dc_gene_symbols,
+                   fromType = "SYMBOL",
+                   toType = "ENTREZID",
+                   OrgDb = org.Hs.eg.db)
+
+# Reactome pathway enrichment
+reactome_results <- enrichPathway(
+  gene = entrez_ids$ENTREZID,
+  pvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+dotplot(reactome_results, showCategory = 15, font.size = 8) +
+  ggtitle("Reactome Pathway Enrichment of DC Features")
+```
+
+## Step 6: Visualize a DC Feature
+
+We select a top DC feature and visualize its sample-level connectivity profile using MDS. Each point represents one sample's embedding of this feature, colored by timepoint.
+
+```{r mds-plot, fig.width = 5, fig.height = 4}
+# Select a top DC feature (e.g., STAT5B)
+chosen_feature <- "RNA_STAT5B"
+chosen_idx <- which(feature_names == chosen_feature)
+
+# Get the per-feature similarity matrix from DC results
+sim_mat <- dc_result$similarity_matrix_list[[chosen_idx]]
+groups <- dc_result$group_list[[chosen_idx]]
+
+# MDS visualization
+plot_mds_cluster(
+  sim_mat,
+  title = paste(chosen_feature, "Connectivity Profile"),
+  cluster = paste0("Day_", groups),
+  custom_colors = c("Day_0" = "#56B4E9", "Day_7" = "#E69F00"),
+  size = 2,
+  ellipse_level = 0.68
+)
+```
+
+The clear separation between Day 0 and Day 7 samples indicates that STAT5B's network neighborhood is substantially rewired upon T-cell activation — despite its expression level remaining unchanged (p = 0.51, T-test on pseudobulk expression).
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,46 @@
+url: https://klugerlab.github.io/MOSAIC/
+
+template:
+  bootstrap: 5
+
+navbar:
+  structure:
+    left:  [home, reference, articles]
+    right: [github]
+  components:
+    reference:
+      text: Functions
+      href: reference/index.html
+    github:
+      icon: fa-github
+      href: https://github.com/KlugerLab/MOSAIC
+
+reference:
+  - title: "Core Embedding"
+    desc: "Run the MOSAIC spectral co-embedding pipeline"
+    contents:
+      - run_MOSAIC
+      - find_elbow_kneedle
+
+  - title: "Differential Connectivity"
+    desc: "Test for features with rewired regulatory networks across conditions"
+    contents:
+      - run_DC_test
+      - calculate_empirical_pvalue
+
+  - title: "Subgroup Detection"
+    desc: "Identify patient subtypes from feature module connectivity"
+    contents:
+      - compute_module_similarity
+      - find_partition_hclust
+
+  - title: "Simulation"
+    desc: "Generate synthetic multi-modal data for benchmarking"
+    contents:
+      - simulate_multimodal_data
+
+  - title: "Visualization"
+    desc: "Plot eigenvalue spectra and sample embeddings"
+    contents:
+      - plot_eigen
+      - plot_mds_cluster

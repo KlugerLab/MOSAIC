@@ -1,0 +1,380 @@
+---
+title: "Clinical Outcome Prediction"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Clinical Outcome Prediction}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE
+)
+```
+
+This vignette demonstrates how MOSAIC's connectivity-derived features can be used for **clinical outcome prediction**, providing a complementary signal to conventional abundance-based analysis. We apply MOSAIC to a large-scale COVID-19 scRNA-seq cohort and show that integrating connectivity and abundance features improves disease severity classification in monocytes.
+
+## Dataset
+
+We use a publicly available COVID-19 scRNA-seq dataset ([Su et al., 2020](https://doi.org/10.1016/j.cell.2020.10.037)) comprising peripheral blood mononuclear cells (PBMCs) from 151 COVID-19 patients stratified by disease severity (Moderate vs. Severe). Control samples are excluded. We focus on **monocytes**, which were identified as the strongest immune driver of severity in our unbiased screen across cell lineages.
+
+## Data Preprocessing
+
+```{r load-data}
+library(MOSAIC)
+library(Seurat)
+library(schard)
+library(glmnet)
+library(pROC)
+library(caret)
+library(ggplot2)
+library(dplyr)
+
+# Load the COVID-19 scRNA-seq data
+seurat_obj <- schard::h5ad2seurat("path/to/Covid_19_PBMC.h5ad", use.raw = TRUE)
+
+# Subset to monocytes, exclude controls
+seurat_mono <- seurat_obj[, seurat_obj$majorType == "Mono"]
+seurat_mono <- seurat_mono[, seurat_mono$`CoVID-19 severity` != "control"]
+
+# Remove samples with too few cells
+sample_counts <- table(seurat_mono$sampleID)
+samples_to_remove <- names(sample_counts[sample_counts < 10])
+seurat_mono <- subset(seurat_mono, subset = sampleID %ni% samples_to_remove)
+```
+
+### Feature Selection
+
+```{r feature-selection}
+counts <- GetAssayData(seurat_mono, assay = "RNA", slot = "counts")
+sample_ids <- unique(as.character(seurat_mono$sampleID))
+
+genes_per_sample <- lapply(sample_ids, function(id) {
+  cells <- which(seurat_mono$sampleID == id)
+  rownames(counts)[rowSums(counts[, cells, drop = FALSE]) > 3]
+})
+genes_to_keep <- Reduce(intersect, genes_per_sample)
+
+seurat_rna <- subset(seurat_mono, features = genes_to_keep)
+seurat_rna <- NormalizeData(seurat_rna)
+```
+
+## Step 1: Run MOSAIC (Single Modality)
+
+MOSAIC's mathematical framework is modality-agnostic. Even with a single modality (RNA), it captures latent regulatory information from the feature connectivity structure.
+
+```{r run-mosaic}
+result <- run_MOSAIC(
+  list(RNA = seurat_rna),
+  assays = c("RNA"),
+  sample_meta = "sampleID",
+  condition_meta = "CoVID-19 severity"
+)
+```
+
+## Step 2: Prepare Prediction Inputs
+
+We construct two types of patient-level feature vectors:
+
+1. **Connectivity features (MOSAIC)**: Each patient's embedding matrix is vectorized into a single feature vector.
+2. **Abundance features (Pseudobulk)**: Raw counts are aggregated per patient and log-normalized.
+
+```{r prepare-inputs}
+# --- Connectivity features ---
+mosaic_vectors <- lapply(result$mosaic_embed_list, as.vector)
+X_mosaic <- do.call(rbind, mosaic_vectors)
+label <- result$annotation$Condition
+y <- ifelse(label %in% c("severe/critical"), 1, 0)
+
+# --- Abundance features (pseudobulk) ---
+pseudobulk_list <- AggregateExpression(
+  seurat_rna,
+  group.by = "sampleID",
+  assays = "RNA",
+  slot = "counts",
+  normalization.method = NULL
+)
+pseudobulk_counts <- pseudobulk_list$RNA
+pb_obj <- CreateSeuratObject(counts = pseudobulk_counts)
+pb_obj <- NormalizeData(pb_obj, normalization.method = "LogNormalize", scale.factor = 10000)
+X_expr <- t(as.matrix(GetAssayData(pb_obj, slot = "data")))
+
+# --- Align sample order ---
+common_samples <- intersect(rownames(X_mosaic), rownames(X_expr))
+X_mosaic <- X_mosaic[common_samples, , drop = FALSE]
+X_expr <- X_expr[common_samples, , drop = FALSE]
+
+y_map <- setNames(label, rownames(result$annotation))
+y <- ifelse(y_map[common_samples] %in% c("severe/critical"), 1, 0)
+```
+
+## Step 3: Repeated Stratified Cross-Validation
+
+We train L1-regularized logistic regression (Lasso) classifiers using three inputs: MOSAIC connectivity features alone, pseudobulk abundance features alone, and a late-fusion integrated model.
+
+```{r cross-validation}
+n_repeats <- 10
+n_folds <- 5
+
+results_mosaic <- c()
+results_expr <- c()
+results_comb <- c()
+
+all_labels <- c()
+all_preds_mos <- c()
+all_preds_exp <- c()
+all_preds_comb <- c()
+
+round_exp_list <- list()
+round_mos_list <- list()
+
+for (seed in seq_len(n_repeats)) {
+  set.seed(seed)
+  folds <- createFolds(factor(y), k = n_folds, list = FALSE)
+
+  round_mos <- rep(NA, length(y))
+  round_exp <- rep(NA, length(y))
+
+  for (i in seq_len(n_folds)) {
+    train_idx <- which(folds != i)
+    test_idx <- which(folds == i)
+
+    # MOSAIC (Connectivity)
+    set.seed(seed * 1000 + i)
+    cv_mos <- cv.glmnet(X_mosaic[train_idx, ], y[train_idx],
+                         family = "binomial", alpha = 1, standardize = TRUE)
+    round_mos[test_idx] <- predict(cv_mos, X_mosaic[test_idx, ],
+                                    s = "lambda.min", type = "response")
+
+    # Pseudobulk (Abundance)
+    set.seed(seed * 1000 + i)
+    cv_exp <- cv.glmnet(X_expr[train_idx, ], y[train_idx],
+                         family = "binomial", alpha = 1, standardize = TRUE)
+    round_exp[test_idx] <- predict(cv_exp, X_expr[test_idx, ],
+                                    s = "lambda.min", type = "response")
+  }
+
+  auc_mos <- auc(roc(y, as.numeric(round_mos), quiet = TRUE))
+  auc_exp <- auc(roc(y, as.numeric(round_exp), quiet = TRUE))
+  round_comb <- (round_mos + round_exp) / 2
+  auc_comb <- auc(roc(y, as.numeric(round_comb), quiet = TRUE))
+
+  results_mosaic <- c(results_mosaic, auc_mos)
+  results_expr <- c(results_expr, auc_exp)
+  results_comb <- c(results_comb, auc_comb)
+
+  all_labels <- c(all_labels, y)
+  all_preds_mos <- c(all_preds_mos, round_mos)
+  all_preds_exp <- c(all_preds_exp, round_exp)
+  all_preds_comb <- c(all_preds_comb, round_comb)
+
+  round_exp_list <- append(round_exp_list, list(round_exp))
+  round_mos_list <- append(round_mos_list, list(round_mos))
+}
+
+cat("Mean MOSAIC AUC:", round(mean(results_mosaic), 3), "\n")
+cat("Mean Expression AUC:", round(mean(results_expr), 3), "\n")
+cat("Mean Combined AUC:", round(mean(results_comb), 3), "\n")
+```
+
+## Figure 6B: ROC Curves
+
+```{r fig6b-roc, fig.width = 5.4, fig.height = 4.6}
+roc_exp_full <- roc(all_labels, all_preds_exp)
+roc_mos_full <- roc(all_labels, all_preds_mos)
+roc_comb_full <- roc(all_labels, all_preds_comb)
+
+roc_data <- rbind(
+  data.frame(FPR = 1 - roc_exp_full$specificities,
+             TPR = roc_exp_full$sensitivities,
+             Model = "Pseudobulk (Abundance)"),
+  data.frame(FPR = 1 - roc_mos_full$specificities,
+             TPR = roc_mos_full$sensitivities,
+             Model = "MOSAIC (Connectivity)"),
+  data.frame(FPR = 1 - roc_comb_full$specificities,
+             TPR = roc_comb_full$sensitivities,
+             Model = "Integrated (Connectivity + Abundance)")
+)
+roc_data$Model <- factor(roc_data$Model, levels = c(
+  "Integrated (Connectivity + Abundance)",
+  "MOSAIC (Connectivity)",
+  "Pseudobulk (Abundance)"
+))
+
+stats_text <- paste0(
+  "AUC Scores\n",
+  "Integrated:  ", sprintf("%.3f", mean(results_comb)), "\n",
+  "MOSAIC:      ", sprintf("%.3f", mean(results_mosaic)), "\n",
+  "Pseudobulk:  ", sprintf("%.3f", mean(results_expr))
+)
+
+ggplot(roc_data, aes(x = FPR, y = TPR, color = Model, linewidth = Model)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray80") +
+  geom_line() +
+  scale_color_manual(values = c("#56B4E9", "#E69F00", "grey60")) +
+  scale_linewidth_manual(values = c(1.5, 1.2, 0.8)) +
+  annotate("text", x = 1, y = 0.35, label = stats_text,
+           hjust = 1, vjust = 0, size = 2.8, lineheight = 1.0) +
+  labs(title = "Predictive Performance for Monocytes",
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = c(1, 0.0),
+    legend.justification = c("right", "bottom"),
+    legend.background = element_blank(),
+    legend.title = element_blank(),
+    legend.key.width = unit(1.0, "cm"),
+    legend.text = element_text(size = 10)
+  )
+```
+
+## Figure 6C: Complementary Risk Stratification
+
+We compare patient-specific risk scores from the Abundance (pseudobulk) and Connectivity (MOSAIC) models, revealing that the two modalities capture orthogonal dimensions of disease severity.
+
+```{r fig6c-scatter, fig.width = 8, fig.height = 6}
+plot_data <- data.frame(
+  Expr_Risk = as.numeric(rowMeans(do.call(cbind, round_exp_list))),
+  Mos_Risk = as.numeric(rowMeans(do.call(cbind, round_mos_list))),
+  Outcome = ifelse(y == 1, "Severe", "Moderate")
+)
+
+mos_exp_cor <- cor(plot_data$Expr_Risk, plot_data$Mos_Risk)
+
+# Define clinical categories
+plot_data$Category <- "Consensus"
+plot_data$Category[plot_data$Expr_Risk < 0.5 & plot_data$Mos_Risk > 0.5 &
+                     plot_data$Outcome == "Severe"] <- "Type_II_Rescue"
+plot_data$Category[plot_data$Expr_Risk > 0.5 & plot_data$Mos_Risk < 0.5 &
+                     plot_data$Outcome == "Moderate"] <- "Specificity_Win"
+plot_data$Category[plot_data$Expr_Risk > 0.5 & plot_data$Mos_Risk < 0.5 &
+                     plot_data$Outcome == "Severe"] <- "Type_I_Rescue"
+
+plot_data$Category <- factor(plot_data$Category,
+  levels = c("Consensus", "Type_II_Rescue", "Type_I_Rescue", "Specificity_Win"),
+  labels = c("Consensus Severe", "Connectivity-Rescued",
+             "Abundance-Rescued", "Abundance False Positive")
+)
+
+color_map <- c("Moderate" = "#56B4E9", "Severe" = "#D55E00")
+
+ggplot(plot_data, aes(x = Expr_Risk, y = Mos_Risk)) +
+  annotate("rect", xmin = 0, xmax = 0.5, ymin = 0.5, ymax = 1.05,
+           fill = "#FFFFE0", alpha = 0.3) +
+  annotate("rect", xmin = 0.5, xmax = 1.05, ymin = 0, ymax = 0.5,
+           fill = "#E6E6FA", alpha = 0.3) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey60") +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey60") +
+  geom_point(data = subset(plot_data, Category == "Consensus Severe"),
+             aes(color = Outcome, shape = Category), size = 3, alpha = 0.6) +
+  geom_point(data = subset(plot_data, Category != "Consensus Severe"),
+             aes(color = Outcome, shape = Category), size = 3.5, stroke = 1.2) +
+  annotate("text", x = 0.05, y = 0.95, label = "Type II: Connectivity-High",
+           hjust = 0, fontface = "bold", color = "#D55E00", size = 3.5) +
+  annotate("text", x = 0.95, y = 0.10, label = "Type I: Abundance-High",
+           hjust = 1, fontface = "bold", color = "darkblue", size = 3.5) +
+  scale_color_manual(values = color_map) +
+  scale_shape_manual(values = c("Connectivity-Rescued" = 17,
+                                "Consensus Severe" = 19,
+                                "Abundance-Rescued" = 15,
+                                "Abundance False Positive" = 1)) +
+  labs(
+    title = "Complementary Mechanisms of Severity",
+    subtitle = paste0("Pearson R = ", round(mos_exp_cor, 2)),
+    x = "Abundance Risk Score (Pseudobulk)",
+    y = "Connectivity Risk Score (MOSAIC)",
+    color = "Clinical Outcome",
+    shape = "Patient Subtype"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey30", size = 11),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+```
+
+## Figure 6E: Top Predictive Features
+
+We extract the Lasso-selected features from each model and rank them by absolute coefficient magnitude to identify the top molecular drivers.
+
+```{r fig6e-drivers, fig.width = 10, fig.height = 5}
+library(cowplot)
+
+# --- Fit final models on full data ---
+fit_expr <- glmnet(X_expr, y, family = "binomial", alpha = 1, standardize = TRUE)
+coef_expr <- coef(fit_expr, s = cv_exp$lambda.min)
+
+fit_mos <- glmnet(X_mosaic, y, family = "binomial", alpha = 1, standardize = TRUE)
+coef_mos <- coef(fit_mos, s = cv_mos$lambda.min)
+
+# --- Abundance drivers ---
+df_expr <- data.frame(
+  Feature = rownames(coef_expr),
+  Weight = as.numeric(coef_expr)
+) %>%
+  filter(Feature != "(Intercept)", Weight != 0) %>%
+  mutate(AbsWeight = abs(Weight)) %>%
+  arrange(desc(AbsWeight)) %>%
+  slice_head(n = 15) %>%
+  mutate(RelWeight = (AbsWeight / max(AbsWeight)) * 100)
+
+df_expr$Feature <- factor(df_expr$Feature, levels = df_expr$Feature[order(df_expr$RelWeight)])
+
+# --- Connectivity drivers (aggregate across latent dimensions) ---
+feature_names <- rownames(result$mosaic_embed_list[[1]])
+dim_r <- ncol(result$mosaic_embed_list[[1]])
+
+df_mos_raw <- data.frame(
+  Feature = c("(Intercept)", rep(feature_names, dim_r)),
+  Weight = as.numeric(coef_mos)
+) %>%
+  filter(Feature != "(Intercept)", Weight != 0)
+
+df_mos_agg <- df_mos_raw %>%
+  group_by(Feature) %>%
+  summarise(AbsWeight = sum(abs(Weight))) %>%
+  arrange(desc(AbsWeight)) %>%
+  slice_head(n = 15) %>%
+  mutate(RelWeight = (AbsWeight / max(AbsWeight)) * 100)
+
+df_mos_agg$Feature <- factor(df_mos_agg$Feature,
+                              levels = df_mos_agg$Feature[order(df_mos_agg$RelWeight)])
+
+# --- Lollipop plot function ---
+plot_drivers <- function(data, title_text, point_color) {
+  ggplot(data, aes(x = RelWeight, y = Feature)) +
+    geom_segment(aes(x = 0, xend = RelWeight, y = Feature, yend = Feature),
+                 color = "grey70") +
+    geom_point(color = point_color, size = 4) +
+    theme_bw(base_size = 14) +
+    labs(title = title_text, x = "Relative Importance (%)", y = "") +
+    theme(
+      axis.text.y = element_text(face = "bold", color = "black"),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      axis.line.x = element_line(color = "black"),
+      axis.ticks.y = element_blank(),
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+      legend.position = "none"
+    )
+}
+
+p_left <- plot_drivers(df_expr, "Top Abundance Drivers", "grey40")
+p_right <- plot_drivers(df_mos_agg, "Top Connectivity Drivers", "#E69F00")
+
+plot_grid(p_left, p_right, ncol = 2, align = "h")
+```
+
+The minimal overlap between the two sets of predictive features confirms that connectivity and abundance capture complementary dimensions of disease variation.
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

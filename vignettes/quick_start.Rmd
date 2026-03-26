@@ -1,0 +1,285 @@
+---
+title: "Quick Start"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Quick Start}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = TRUE
+)
+```
+
+This vignette walks through the complete MOSAIC pipeline using **simulated data only** — no external datasets required. After installing MOSAIC, you can run every code block below to see the framework in action.
+
+We will:
+
+1. Generate synthetic multi-modal data with known differential connectivity (DC) signal
+2. Run the MOSAIC embedding
+3. Perform differential connectivity analysis
+4. Detect patient subgroups from feature modules
+
+## Step 1: Generate Simulated Data
+
+We simulate a two-modality dataset with 20 samples (10 per condition), where 20% of features undergo connectivity rewiring between conditions A and B.
+
+```{r simulate}
+library(MOSAIC)
+library(ggplot2)
+
+sim <- simulate_multimodal_data(
+  simulation_type = "DC",
+  n_features = c(500, 400),
+  signal_prop = 0.2,
+  seed = 42,
+  rescale = TRUE,
+  add_batch = FALSE,
+  nonlinear = FALSE,
+  sample_noise_level = 0.5,
+  feature_noise_level = 0.5,
+  cell_noise_level = 0.5
+)
+
+cat("Modalities:", length(sim$seurat_list), "\n")
+cat("Samples:", nrow(sim$sample_metadata), "\n")
+cat("Features per modality:", sapply(sim$seurat_list, nrow), "\n")
+```
+
+The returned Seurat objects include ground-truth labels: `feature_cluster` (which module a feature belongs to) and `is_de` (whether the feature was rewired).
+
+```{r ground-truth}
+# Ground truth for modality 1
+feat_meta <- sim$seurat_list[[1]][["originalexp"]][[]]
+cat("DC features in modality 1:", sum(feat_meta$is_de), "/", nrow(feat_meta), "\n")
+```
+
+## Step 2: Run MOSAIC Embedding
+
+```{r run-mosaic}
+result <- run_MOSAIC(
+  sim$seurat_list,
+  assays = c("originalexp", "originalexp"),
+  sample_meta = "sample_id",
+  condition_meta = "condition"
+)
+```
+
+### Visualize the Eigenvalue Spectrum
+
+The eigenvalues from the aggregated spectral decomposition reveal the effective dimensionality. The red line marks the automatically selected elbow.
+
+```{r eigenplot, fig.width = 5, fig.height = 3.5}
+elbow <- find_elbow_kneedle(result$eigenvalues)
+
+plot_eigen(result$eigenvalues) +
+  geom_vline(xintercept = elbow, color = "red", linetype = "dashed") +
+  ggtitle(paste0("Eigenvalue spectrum (elbow = ", elbow, ")"))
+```
+
+## Step 3: Differential Connectivity Analysis
+
+### 3a. Run DC test on real labels
+
+```{r dc-real}
+n_sample <- length(result$mosaic_embed_list)
+
+dc_result <- run_DC_test(
+  result$mosaic_embed_list,
+  n_sample = n_sample,
+  groups = result$annotation$Condition
+)
+```
+
+### 3b. Run DC test on shuffled labels (null distribution)
+
+We shuffle cell-to-sample assignments to destroy condition-specific signals, re-run MOSAIC, and collect null F-statistics.
+
+```{r dc-null}
+# Shuffle sample labels
+set.seed(123)
+shuffled_idx <- sample(ncol(sim$seurat_list[[1]]))
+
+for (k in seq_along(sim$seurat_list)) {
+  sim$seurat_list[[k]]$shuffled_sample <- sim$seurat_list[[k]]$sample_id[shuffled_idx]
+  sim$seurat_list[[k]]$shuffled_condition <- sim$seurat_list[[k]]$condition[shuffled_idx]
+}
+
+shuffle_mosaic <- run_MOSAIC(
+  sim$seurat_list,
+  assays = c("originalexp", "originalexp"),
+  sample_meta = "shuffled_sample",
+  condition_meta = "shuffled_condition",
+  verbose = FALSE
+)
+
+shuffle_dc <- run_DC_test(
+  shuffle_mosaic$mosaic_embed_list,
+  n_sample = n_sample,
+  groups = shuffle_mosaic$annotation$Condition
+)
+```
+
+### 3c. Compute empirical p-values
+
+```{r pvalues}
+F_obs <- unlist(dc_result$F_stats_list)
+F_null <- unlist(shuffle_dc$F_stats_list)
+
+pvalues <- sapply(F_obs, function(x) calculate_empirical_pvalue(x, F_null))
+
+dc_idx <- which(pvalues < 0.05)
+cat(length(dc_idx), "DC features detected out of", length(pvalues), "total\n")
+```
+
+### 3d. Compare with ground truth
+
+```{r evaluate-dc}
+# Ground truth: combine is_de from both modalities
+ground_truth <- c(
+  sim$seurat_list[[1]][["originalexp"]][[]]$is_de,
+  sim$seurat_list[[2]][["originalexp"]][[]]$is_de
+)
+
+true_dc <- which(ground_truth)
+detected_dc <- dc_idx
+
+precision <- length(intersect(detected_dc, true_dc)) / length(detected_dc)
+recall <- length(intersect(detected_dc, true_dc)) / length(true_dc)
+
+cat(sprintf("Precision: %.3f\n", precision))
+cat(sprintf("Recall: %.3f\n", recall))
+```
+
+### 3e. Visualize a DC feature
+
+```{r mds-dc, fig.width = 5, fig.height = 4}
+# Pick a true DC feature
+chosen_idx <- true_dc[1]
+
+sim_mat <- dc_result$similarity_matrix_list[[chosen_idx]]
+groups <- dc_result$group_list[[chosen_idx]]
+
+plot_mds_cluster(
+  sim_mat,
+  title = paste("Feature", chosen_idx, "(true DC)"),
+  cluster = groups,
+  custom_colors = c("A" = "#56B4E9", "B" = "#E69F00"),
+  size = 2,
+  ellipse_level = 0.68
+)
+```
+
+## Step 4: Unsupervised Subgroup Detection
+
+Even without using condition labels, MOSAIC can discover patient subgroups by identifying feature modules whose connectivity patterns partition samples into distinct groups.
+
+### 4a. Compute feature stratification profiles
+
+```{r stratification}
+# Use the similarity matrices from DC test (already computed)
+sim_vectors <- lapply(dc_result$similarity_matrix_list, function(mat) {
+  mat[upper.tri(mat, diag = FALSE)]
+})
+
+strat_matrix <- do.call(cbind, sim_vectors)
+feature_corr <- cor(strat_matrix, method = "spearman")
+```
+
+### 4b. Identify feature modules
+
+```{r modules}
+library(dynamicTreeCut)
+
+dist_feat <- as.dist(1 - feature_corr)
+hc_feat <- hclust(dist_feat, method = "ward.D2")
+
+feature_clusters <- cutreeDynamic(
+  dendro = hc_feat,
+  distM = as.matrix(dist_feat),
+  minClusterSize = 15,
+  method = "hybrid",
+  deepSplit = 2
+)
+names(feature_clusters) <- colnames(feature_corr)
+
+module_ids <- sort(unique(feature_clusters[feature_clusters > 0]))
+cat(length(module_ids), "modules identified\n")
+cat("Module sizes:", sapply(module_ids, function(m) sum(feature_clusters == m)), "\n")
+```
+
+### 4c. Screen modules for subgroups
+
+```{r screen-modules}
+total_features <- nrow(result$mosaic_embed_list[[1]])
+
+screen_results <- data.frame(
+  module = integer(), n_features = integer(),
+  silhouette = numeric(), balanced = logical(),
+  stringsAsFactors = FALSE
+)
+
+for (m in module_ids) {
+  idx <- which(feature_clusters == m)
+  sim_mat <- compute_module_similarity(result$mosaic_embed_list, idx)
+  partition <- find_partition_hclust(as.dist(1 - sim_mat))
+
+  screen_results <- rbind(screen_results, data.frame(
+    module = m,
+    n_features = length(idx),
+    silhouette = ifelse(partition$balanced, partition$silhouette, NA),
+    balanced = partition$balanced
+  ))
+}
+
+screen_results <- screen_results[order(-screen_results$silhouette), ]
+print(screen_results)
+```
+
+### 4d. Visualize the best module's heatmap
+
+```{r heatmap, fig.width = 5.5, fig.height = 5}
+library(pheatmap)
+
+best_module <- screen_results$module[which.max(screen_results$silhouette)]
+best_idx <- which(feature_clusters == best_module)
+
+sim_mat <- compute_module_similarity(result$mosaic_embed_list, best_idx)
+partition <- find_partition_hclust(as.dist(1 - sim_mat))
+
+annotation <- result$annotation
+annotation$Subgroup <- ifelse(partition$groups == 1, "Group1", "Group2")
+
+annotation_colors <- list(
+  Condition = c("A" = "#56B4E9", "B" = "#E69F00"),
+  Subgroup = c("Group1" = "#4DBBD5", "Group2" = "#E64B35")
+)
+
+pheatmap(
+  sim_mat,
+  annotation_row = annotation,
+  annotation_col = annotation,
+  annotation_colors = annotation_colors,
+  cluster_rows = partition$hclust,
+  cluster_cols = partition$hclust,
+  show_rownames = TRUE,
+  show_colnames = FALSE,
+  main = sprintf("Module %d | %d features | Silhouette = %.3f",
+                 best_module, length(best_idx), partition$silhouette)
+)
+
+cat("\nSubgroup x Condition:\n")
+print(table(annotation$Subgroup, annotation$Condition))
+```
+
+If the simulation is working correctly, the discovered subgroups should align closely with the true conditions A and B, since the DC signal creates condition-specific connectivity patterns that MOSAIC's modular approach can recover in an unsupervised manner.
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

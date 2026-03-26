@@ -1,0 +1,14 @@
+bibentry(
+  bibtype  = "Misc",
+  title    = "MOSAIC: Unified Feature and Sample Joint Embeddings for Population-Scale Single-Cell Multi-Omics",
+  author   = c(
+    person("Chang", "Lu"),
+    person("Yuval", "Kluger"),
+    person("Rong", "Ma")
+  ),
+  year     = "2025",
+  textVersion = paste(
+    "Lu, C., Kluger, Y., & Ma, R. (2025).",
+    "MOSAIC: Unified Feature and Sample Joint Embeddings for Population-Scale Single-Cell Multi-Omics."
+  )
+)

@@ -1,0 +1,24 @@
+<urlset xmlns = 'http://www.sitemaps.org/schemas/sitemap/0.9'>
+<url><loc>https://klugerlab.github.io/MOSAIC/404.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/LICENSE-text.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/LICENSE.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/articles/clinical_prediction.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/articles/differential_connectivity.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/articles/index.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/articles/quick_start.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/articles/subgroup_detection.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/authors.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/index.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/reference/MOSAIC-package.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/reference/calculate_empirical_pvalue.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/reference/compute_module_similarity.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/reference/find_elbow_kneedle.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/reference/find_partition_hclust.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/reference/index.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/reference/plot_eigen.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/reference/plot_mds_cluster.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/reference/run_DC_test.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/reference/run_MOSAIC.html</loc></url>
+<url><loc>https://klugerlab.github.io/MOSAIC/reference/simulate_multimodal_data.html</loc></url>
+</urlset>
+

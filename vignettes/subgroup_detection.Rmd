@@ -1,0 +1,380 @@
+---
+title: "Unsupervised Sample Subgroup Detection"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Unsupervised Sample Subgroup Detection}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE
+)
+```
+
+This vignette demonstrates MOSAIC's **unsupervised sample subgroup detection** pipeline. Unlike global approaches that compute patient similarity across all features, MOSAIC groups multi-modal features into coherent connectivity modules and tests whether specific modules delineate distinct patient subtypes. This modular strategy can reveal cryptic subgroup structure that global methods miss.
+
+We apply MOSAIC to a multi-omic prefrontal cortex (PFC) cohort with paired snRNA-seq and snATAC-seq from HIV+ individuals, focusing on L2/3 inhibitory neurons.
+
+## Dataset
+
+We use a single-nucleus multi-omic dataset of human prefrontal cortex tissue comprising 31 donors (18 HIV+, 13 controls) with paired snRNA-seq and snATAC-seq ([Farris et al., 2024](https://doi.org/10.1038/s41467-024-53624-8)). We focus on **L2/3-IT inhibitory neurons** and restrict the analysis to HIV samples only (excluding controls), treating disease labels as unknown.
+
+## Data Preprocessing
+
+```{r load-data}
+library(MOSAIC)
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(dynamicTreeCut)
+library(uwot)
+library(pheatmap)
+
+# Load preprocessed Seurat objects
+rna_seurat <- readRDS("path/to/PFC_L23-IT_rna.RDS")
+atac_seurat <- readRDS("path/to/PFC_L23-IT_atac.RDS")
+
+# Use gene activity scores for ATAC
+DefaultAssay(atac_seurat) <- "GeneACT"
+atac_seurat[["ATAC"]] <- NULL
+```
+
+### Sample and Feature Filtering
+
+```{r filtering}
+# Remove samples with too few cells
+sample_counts <- table(rna_seurat$sample_name)
+samples_to_remove <- names(sample_counts[sample_counts < 10])
+rna_seurat <- subset(rna_seurat, subset = sample_name %ni% samples_to_remove)
+atac_seurat <- subset(atac_seurat, subset = sample_name %ni% samples_to_remove)
+
+# Exclude controls — treat HIV subgroup labels as unknown
+rna_seurat <- subset(rna_seurat, subset = condition_new %ni% c("CTR"))
+atac_seurat <- subset(atac_seurat, subset = condition_new %ni% c("CTR"))
+
+# RNA feature selection: expressed in all samples + variable
+counts <- GetAssayData(rna_seurat, assay = "RNA", slot = "counts")
+sample_ids <- unique(as.character(rna_seurat$sample_name))
+genes_per_sample <- lapply(sample_ids, function(id) {
+  cells <- which(rna_seurat$sample_name == id)
+  rownames(counts)[rowSums(counts[, cells, drop = FALSE]) > 3]
+})
+genes_to_keep <- Reduce(intersect, genes_per_sample)
+rna_seurat <- FindVariableFeatures(rna_seurat, nfeatures = 10000)
+genes_to_keep <- genes_to_keep[genes_to_keep %in% VariableFeatures(rna_seurat)]
+
+# ATAC feature selection
+counts_atac <- GetAssayData(atac_seurat, assay = "GeneACT", slot = "counts")
+peaks_per_sample <- lapply(sample_ids, function(id) {
+  cells <- which(atac_seurat$sample_name == id)
+  rownames(counts_atac)[rowSums(counts_atac[, cells, drop = FALSE]) > 5]
+})
+atac_seurat <- FindVariableFeatures(atac_seurat, nfeatures = 3000)
+peaks_to_keep <- Reduce(intersect, peaks_per_sample)
+peaks_to_keep <- peaks_to_keep[peaks_to_keep %in% VariableFeatures(atac_seurat)]
+
+# Subset and normalize
+seurat_rna <- subset(rna_seurat, features = genes_to_keep)
+seurat_atac <- subset(atac_seurat, features = peaks_to_keep)
+seurat_rna <- NormalizeData(seurat_rna)
+seurat_atac <- NormalizeData(seurat_atac)
+
+# Feature name vector
+feature_names <- c(
+  rownames(seurat_rna[["RNA"]]),
+  paste0("ATAC-", rownames(seurat_atac[["GeneACT"]]))
+)
+```
+
+## Step 1: Run MOSAIC Embedding
+
+```{r run-mosaic}
+result <- run_MOSAIC(
+  seurat_list = list(RNA = seurat_rna, ATAC = seurat_atac),
+  assays = c("RNA", "GeneACT"),
+  sample_meta = "sample_name",
+  condition_meta = "condition_new"
+)
+```
+
+## Step 2: Compute Per-Feature Stratification Profiles
+
+For each feature, we extract its per-sample similarity matrix (how similarly does this feature behave across patients). We then compute a feature-feature correlation matrix based on these stratification profiles — features that stratify patients in similar ways are grouped into modules.
+
+```{r stratification-profiles}
+# Get per-feature similarity matrices (without running PERMANOVA)
+n_sample <- length(result$mosaic_embed_list)
+dc_result <- run_DC_test(
+  result$mosaic_embed_list,
+  n_sample = n_sample,
+  groups = result$annotation$Condition,
+  dist_method = "cosine"
+)
+
+# Extract upper triangle of each similarity matrix as a stratification vector
+sim_vectors <- lapply(dc_result$similarity_matrix_list, function(mat) {
+  mat[upper.tri(mat, diag = FALSE)]
+})
+
+# Feature-feature Spearman correlation
+strat_matrix <- do.call(cbind, sim_vectors)
+feature_correlation_matrix <- cor(strat_matrix, method = "spearman")
+```
+
+## Step 3: Identify Feature Modules
+
+We apply hierarchical clustering with dynamic tree cut to identify coherent groups of features that co-vary in their patient stratification patterns.
+
+```{r module-identification}
+dist_matrix <- as.dist(1 - feature_correlation_matrix)
+hclust_features <- hclust(dist_matrix, method = "ward.D2")
+
+feature_clusters <- cutreeDynamic(
+  dendro = hclust_features,
+  distM = as.matrix(dist_matrix),
+  minClusterSize = 20,
+  method = "hybrid",
+  deepSplit = 2
+)
+names(feature_clusters) <- colnames(feature_correlation_matrix)
+
+module_ids <- sort(unique(feature_clusters[feature_clusters > 0]))
+cat(length(module_ids), "feature modules identified\n")
+```
+
+### Feature Embedding UMAP Colored by Module
+
+We visualize the feature-level embedding to confirm that modules form coherent clusters.
+
+```{r feature-umap, fig.width = 8, fig.height = 5.5}
+# PCA on the feature correlation matrix, then UMAP
+pca_res <- prcomp(feature_correlation_matrix, scale. = TRUE)
+n_pcs <- find_elbow_kneedle(pca_res$sdev[1:100])
+umap_res <- umap(pca_res$x[, 1:n_pcs], n_neighbors = 30, min_dist = 0.3)
+
+# Color palette for modules
+pal36 <- c(
+  "#4E79A7","#A0CBE8","#F28E2B","#FFBE7D","#59A14F","#8CD17D",
+  "#B6992D","#F1CE63","#499894","#86BCB6","#E15759","#FF9D9A",
+  "#79706E","#BAB0AC","#D37295","#FABFD2","#B07AA1","#D4A6C8",
+  "#9D7660","#D7B5A6","#2E91E5","#1CA71C","#FB0D0D","#DA16FF",
+  "#222A2A","#B68100","#EB663B","#750D86","#511CFB","#00A08B",
+  "#FB00D1","#FC0080","#B2828D","#6C7C32","#778AAE","#862A16"
+)
+cluster_ids <- sort(unique(feature_clusters))
+cluster_colors <- setNames(pal36[seq_along(cluster_ids)], cluster_ids)
+
+df_umap <- data.frame(
+  UMAP1 = umap_res[, 1],
+  UMAP2 = umap_res[, 2],
+  module = as.factor(feature_clusters)
+)
+
+ggplot(df_umap, aes(UMAP1, UMAP2, color = module)) +
+  geom_point(size = 0.7) +
+  scale_color_manual(values = cluster_colors, name = "Feature Module") +
+  theme_classic(base_size = 16) +
+  ggtitle("Feature Embedding Colored by Module") +
+  theme(legend.key.size = unit(0.4, "cm"))
+```
+
+## Step 4: Screen Modules for Patient Subgroups
+
+For each module, we compute a module-specific sample similarity matrix using `compute_module_similarity()`, then test whether it reveals a balanced two-way partition with `find_partition_hclust()`. Significance is assessed by a permutation test comparing the observed silhouette score against random feature sets of the same size.
+
+```{r screen-modules}
+N_PERM <- 1000
+total_features <- nrow(result$mosaic_embed_list[[1]])
+
+module_results <- data.frame(
+  module = integer(), n_features = integer(),
+  silhouette = numeric(), perm_pval = numeric(),
+  group1_size = integer(), group2_size = integer(),
+  stringsAsFactors = FALSE
+)
+module_assignments <- list()
+module_sim_matrices <- list()
+module_hclust_list <- list()
+
+for (m in module_ids) {
+  chosen_idx <- which(feature_clusters == m)
+  n_feat <- length(chosen_idx)
+
+  sim_mat <- compute_module_similarity(result$mosaic_embed_list, chosen_idx)
+  dist_mat <- as.dist(1 - sim_mat)
+  partition <- find_partition_hclust(dist_mat)
+
+  if (!partition$balanced) {
+    module_results <- rbind(module_results, data.frame(
+      module = m, n_features = n_feat,
+      silhouette = NA, perm_pval = NA,
+      group1_size = NA, group2_size = NA
+    ))
+    next
+  }
+
+  sil_score <- partition$silhouette
+
+  # Permutation test
+  null_sils <- numeric(N_PERM)
+  for (p in seq_len(N_PERM)) {
+    rand_idx <- sample(total_features, n_feat, replace = FALSE)
+    rand_sim <- compute_module_similarity(result$mosaic_embed_list, rand_idx)
+    rand_dist <- as.dist(1 - rand_sim)
+    rand_part <- find_partition_hclust(rand_dist)
+    null_sils[p] <- ifelse(rand_part$balanced, rand_part$silhouette, 0)
+  }
+  perm_pval <- (sum(null_sils >= sil_score) + 1) / (N_PERM + 1)
+
+  group_sizes <- table(partition$groups)
+  module_results <- rbind(module_results, data.frame(
+    module = m, n_features = n_feat,
+    silhouette = sil_score, perm_pval = perm_pval,
+    group1_size = group_sizes[1], group2_size = group_sizes[2]
+  ))
+  module_assignments[[as.character(m)]] <- partition$groups
+  module_sim_matrices[[as.character(m)]] <- sim_mat
+  module_hclust_list[[as.character(m)]] <- partition$hclust
+}
+
+# Multiple testing correction
+module_results$padj <- p.adjust(module_results$perm_pval, method = "BH")
+module_results <- module_results[order(module_results$padj, -module_results$silhouette), ]
+
+sig_modules <- module_results[!is.na(module_results$padj) & module_results$padj < 0.05, ]
+cat(nrow(sig_modules), "significant modules found\n")
+print(sig_modules)
+```
+
+## Step 5: Visualize a Significant Module
+
+We select the top significant module and visualize its sample similarity heatmap, annotated by the discovered subgroups and known conditions.
+
+```{r module-heatmap, fig.width = 6.2, fig.height = 5.5}
+# Pick the top module (most balanced + highest silhouette)
+MODULE_ID <- sig_modules$module[1]
+m_char <- as.character(MODULE_ID)
+
+sim_mat <- module_sim_matrices[[m_char]]
+groups <- module_assignments[[m_char]]
+hc <- module_hclust_list[[m_char]]
+
+# Build annotation
+annotation <- result$annotation
+annotation$Subgroup <- ifelse(groups == 1, "Group1", "Group2")
+
+annotation_colors <- list(
+  Subgroup = c("Group1" = "#4DBBD5", "Group2" = "#E64B35")
+)
+if ("Condition" %in% colnames(annotation)) {
+  conditions <- unique(annotation$Condition)
+  cond_palette <- c("HIV" = "#FC8D62", "HIVOUD" = "#E5C494",
+                    "OUD" = "#8DA0CB", "CTR" = "#66C2A5")
+  annotation_colors$Condition <- cond_palette[intersect(conditions, names(cond_palette))]
+}
+
+m_row <- module_results[module_results$module == MODULE_ID, ]
+
+pheatmap(
+  sim_mat,
+  annotation_row = annotation,
+  annotation_col = annotation,
+  annotation_colors = annotation_colors,
+  cluster_rows = hc,
+  cluster_cols = hc,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  main = sprintf("Module %d | %d features | Silhouette = %.3f",
+                 MODULE_ID, m_row$n_features, m_row$silhouette)
+)
+
+# Cross-tabulation
+cat("\nSubgroup x Condition:\n")
+print(table(annotation$Subgroup, annotation$Condition))
+```
+
+## Step 6: Differential Analysis Between Subgroups
+
+We assign cells to the discovered subgroups based on their donor's group membership, then perform differential expression analysis between the two subgroups to characterize their molecular differences.
+
+```{r differential-analysis, fig.width = 6, fig.height = 5}
+# Assign subgroup labels to cells
+group1_samples <- names(groups[groups == 1])
+group2_samples <- names(groups[groups == 2])
+
+rna_seurat$subgroup <- ifelse(
+  rna_seurat$sample_name %in% group1_samples, "Group1",
+  ifelse(rna_seurat$sample_name %in% group2_samples, "Group2", NA)
+)
+rna_seurat <- subset(rna_seurat, subset = !is.na(subgroup))
+
+# RNA differential expression
+Idents(rna_seurat) <- "subgroup"
+de_rna <- FindMarkers(rna_seurat,
+                       ident.1 = "Group1", ident.2 = "Group2",
+                       test.use = "MAST",
+                       logfc.threshold = 0.25, min.pct = 0.1)
+
+de_rna$gene <- rownames(de_rna)
+de_rna$significance <- "Not Significant"
+de_rna$significance[de_rna$p_val_adj < 0.01 & de_rna$avg_log2FC > 1] <- "Up in Group1"
+de_rna$significance[de_rna$p_val_adj < 0.01 & de_rna$avg_log2FC < -1] <- "Down in Group1"
+
+cat(sprintf("RNA DE: %d up, %d down (padj<0.01, |log2FC|>1)\n",
+            sum(de_rna$significance == "Up in Group1"),
+            sum(de_rna$significance == "Down in Group1")))
+
+# Volcano plot
+ggplot(de_rna, aes(x = avg_log2FC, y = -log10(p_val_adj), color = significance)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("Up in Group1" = "#D73027",
+                                "Down in Group1" = "#4575B4",
+                                "Not Significant" = "grey")) +
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  theme_minimal() +
+  labs(title = sprintf("RNA DE Between Module %d Subgroups", MODULE_ID),
+       x = "Log2 Fold Change", y = "-Log10 Adjusted P-value")
+```
+
+### Pathway Enrichment
+
+```{r pathway-enrichment}
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Hs.eg.db)
+
+up_genes <- de_rna$gene[de_rna$significance == "Up in Group1"]
+if (length(up_genes) > 5) {
+  entrez_up <- bitr(up_genes, fromType = "SYMBOL",
+                    toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  reactome_up <- enrichPathway(gene = entrez_up$ENTREZID,
+                                pvalueCutoff = 0.1, readable = TRUE)
+  if (nrow(as.data.frame(reactome_up)) > 0) {
+    print(dotplot(reactome_up, showCategory = 15, font.size = 8) +
+            ggtitle("Pathways Enriched in Group1"))
+  }
+}
+
+down_genes <- de_rna$gene[de_rna$significance == "Down in Group1"]
+if (length(down_genes) > 5) {
+  entrez_down <- bitr(down_genes, fromType = "SYMBOL",
+                      toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  reactome_down <- enrichPathway(gene = entrez_down$ENTREZID,
+                                  pvalueCutoff = 0.1, readable = TRUE)
+  if (nrow(as.data.frame(reactome_down)) > 0) {
+    print(dotplot(reactome_down, showCategory = 15, font.size = 8) +
+            ggtitle("Pathways Enriched in Group2"))
+  }
+}
+```
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
